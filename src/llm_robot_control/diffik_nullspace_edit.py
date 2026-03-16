@@ -1,4 +1,4 @@
-# This code is from https://github.com/kevinzakka/mjctrl -- not written by me
+# This code is from https://github.com/kevinzakka/mjctrl -- not written by me, I only changed it a bit
 
 import mujoco
 import mujoco.viewer
