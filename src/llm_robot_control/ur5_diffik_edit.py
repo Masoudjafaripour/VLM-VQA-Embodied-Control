@@ -4,6 +4,13 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import time
+import os
+import imageio.v2 as imageio
+
+os.makedirs("outputs/ur5_images", exist_ok=True)
+# clear this dir
+for f in os.listdir("outputs/ur5_images"):
+    os.remove(os.path.join("outputs/ur5_images", f))
 
 # Integration timestep in seconds. This corresponds to the amount of time the joint
 # velocities will be integrated for to obtain the desired joint positions.
@@ -93,7 +100,7 @@ def plan_waypoints(A: np.ndarray,
 
 def get_target_xyz(t: float,
                    waypoints: list[np.ndarray],
-                   speed: float = 0.5) -> np.ndarray:
+                   speed: float = 1.5) -> np.ndarray:
     """
     Move smoothly along piecewise-linear waypoint path.
     """
@@ -185,6 +192,9 @@ def main() -> None:
 
     renderer = mujoco.Renderer(model, height=480, width=640)
 
+    os.makedirs("outputs", exist_ok=True)
+    video_writer = imageio.get_writer("outputs/ur5_video.mp4", fps=30)
+
     with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=False) as viewer:
         # Reset the simulation to the initial keyframe.
         mujoco.mj_resetDataKeyframe(model, data, key_id)
@@ -192,23 +202,42 @@ def main() -> None:
         # Initialize the camera view to that of the free camera.
         mujoco.mjv_defaultFreeCamera(model, viewer.cam)
 
+        viewer.cam.azimuth = 180
+        viewer.cam.elevation = -20
+        viewer.cam.distance = 1.5
+        viewer.cam.lookat[:] = [0.5, 0.0, 0.3]
+
         # Toggle site frame visualization.
         viewer.opt.frame = mujoco.mjtFrame.mjFRAME_SITE
 
+        last_vlm_time = -0.5
+        vlm_period = 0.5   # seconds
         while viewer.is_running():
             step_start = time.time()
 
             # Set the target position of the end-effector site.
-            # data.mocap_pos[mocap_id, 0:2] = circle(data.time, 0.1, 0.5, 0.0, 0.5)
-            # data.mocap_pos[mocap_id] = get_target_xyz(data.time)
-            data.mocap_pos[mocap_id] = get_target_xyz(data.time, waypoints, speed=0.10)
+            data.mocap_pos[mocap_id] = get_target_xyz(data.time, waypoints, speed=0.5)
 
             # --- capture image for VLM ---
             renderer.update_scene(data)
             img = renderer.render()
+            video_writer.append_data(img)
 
             from PIL import Image
             pil_img = Image.fromarray(img)
+
+            if data.time - last_vlm_time >= vlm_period:
+                renderer.update_scene(data)
+                img = renderer.render()
+
+                from PIL import Image
+                pil_img = Image.fromarray(img)
+
+                # send pil_img to VLM here
+                print(last_vlm_time, data.time, "Captured image for VLM")
+                save_path = f"outputs/ur5_images/img_{data.time:.2f}.png"
+                pil_img.save(save_path)
+                last_vlm_time = data.time
 
             # Position error.
             error_pos[:] = data.mocap_pos[mocap_id] - data.site(site_id).xpos
@@ -246,6 +275,8 @@ def main() -> None:
             time_until_next_step = dt - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
+
+    video_writer.close()
 
 
 if __name__ == "__main__":
