@@ -216,7 +216,7 @@ def main() -> None:
             step_start = time.time()
 
             # Set the target position of the end-effector site.
-            data.mocap_pos[mocap_id] = get_target_xyz(data.time, waypoints, speed=0.5)
+            data.mocap_pos[mocap_id] = get_target_xyz(data.time, waypoints, speed=0.2)
 
             # --- capture image for VLM ---
             renderer.update_scene(data)
