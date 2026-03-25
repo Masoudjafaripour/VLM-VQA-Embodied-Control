@@ -1,5 +1,6 @@
 rob_venv
 models
+external
 # outputs
 # Byte-compiled / optimized / DLL files
 __pycache__/
