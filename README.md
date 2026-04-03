@@ -37,3 +37,9 @@ robot.execute(action)
 * Pick-and-place tasks
 * Spatial reasoning experiments
 * VLM-based robot planning
+
+
+## UR5 Null Space Control
+<img src="assets/ur5_nullspace_control.png" width="400">
+
+Implements differential inverse kinematics with null space control on a UR5e arm in MuJoCo. The end-effector tracks a waypoint trajectory while avoiding a spherical obstacle, with joint velocities solved via a damped pseudoinverse Jacobian.
