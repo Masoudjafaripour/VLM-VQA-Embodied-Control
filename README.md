@@ -43,3 +43,9 @@ robot.execute(action)
 <img src="assets/ur5_nullspace_control.png" width="400">
 
 Implements differential inverse kinematics with null space control on a UR5e arm in MuJoCo. The end-effector tracks a waypoint trajectory while avoiding a spherical obstacle, with joint velocities solved via a damped pseudoinverse Jacobian.
+
+## LIBERO Benchmark
+
+Baseline setup for the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) manipulation benchmark, with a pluggable VLM/VLA rollout loop. See [baseline/LIBERO/](baseline/LIBERO/) for setup, scripts, and details.
+
+<img src="baseline/LIBERO/outputs/libero_spatial_task0.png" width="300"> <img src="baseline/LIBERO/outputs/libero_spatial_task0_rollout.gif" width="300">
