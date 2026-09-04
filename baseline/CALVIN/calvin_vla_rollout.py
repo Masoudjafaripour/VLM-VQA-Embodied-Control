@@ -1,18 +1,23 @@
 """Rollout a CALVIN task with a pluggable VLM/VLA policy.
 
 Any policy that implements `get_action(image, instruction) -> np.ndarray[7]`
-can drive the env. Swap DummyPolicy for OpenVLAPolicy (or your own VLM/VLA
-wrapper) to close the loop with a real model.
+can drive the env (see baseline/Models/VLAs.py for the interface and the full
+set of VLA wrappers evaluated in this repo). Swap DummyPolicy for OpenVLAPolicy
+(or your own VLM/VLA wrapper) to close the loop with a real model.
 
 Run with the vla_venv:
     vla_venv/bin/python baseline/CALVIN/calvin_vla_rollout.py
 """
 import os
+import sys
 
 import hydra
 import numpy as np
 from hydra import compose, initialize_config_dir
 from PIL import Image
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from Models.VLAs import DummyPolicy, OpenVLAPolicy, Policy  # noqa: E402
 
 CALVIN_ROOT = os.path.expanduser("~/calvin_repo")
 CONF_DIR = os.path.join(CALVIN_ROOT, "calvin_env", "conf")
@@ -29,51 +34,6 @@ TASK_TO_INSTRUCTION = {
     "rotate_blue_block_right": "rotate the blue block right",
     "push_pink_block_left": "push the pink block left",
 }
-
-
-class Policy:
-    """Interface every VLM/VLA policy plugged into this rollout must implement."""
-
-    def get_action(self, image: np.ndarray, instruction: str) -> np.ndarray:
-        raise NotImplementedError
-
-
-class DummyPolicy(Policy):
-    """Random-action placeholder so the rollout runs without any model weights."""
-
-    def get_action(self, image: np.ndarray, instruction: str) -> np.ndarray:
-        action_displacement = np.random.uniform(-1, 1, size=6)
-        action_gripper = np.random.choice([-1, 1], size=1)
-        return np.concatenate([action_displacement, action_gripper])
-
-
-class OpenVLAPolicy(Policy):
-    """Real VLA policy via OpenVLA (https://github.com/openvla/openvla).
-
-    Needs: pip install "transformers==4.40.1" "tokenizers==0.19.1" "timm==0.9.10"
-    "accelerate==0.25.0" (transformers>=5 dropped AutoModelForVision2Seq, which
-    OpenVLA's remote code relies on), and a GPU for practical speed.
-    `unnorm_key` must match a dataset OpenVLA was trained/fine-tuned on; OpenVLA
-    is not released with a CALVIN-specific head, so plug in your own fine-tuned
-    checkpoint's key here.
-    """
-
-    def __init__(self, model_id: str = "openvla/openvla-7b", device: str = "cuda", unnorm_key: str = "bridge_orig"):
-        import torch
-        from transformers import AutoModelForVision2Seq, AutoProcessor
-
-        self.device = device
-        self.unnorm_key = unnorm_key
-        self.torch = torch
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, trust_remote_code=True
-        ).to(device)
-
-    def get_action(self, image: np.ndarray, instruction: str) -> np.ndarray:
-        prompt = f"In: What action should the robot take to {instruction}?\nOut:"
-        inputs = self.processor(prompt, Image.fromarray(image)).to(self.device, dtype=self.torch.bfloat16)
-        return self.model.predict_action(**inputs, unnorm_key=self.unnorm_key, do_sample=False)
 
 
 def make_env(scene: str):
@@ -120,11 +80,12 @@ def main():
     parser.add_argument("--task", default="lift_red_block_table", choices=list(TASK_TO_INSTRUCTION))
     parser.add_argument("--n-steps", type=int, default=20)
     parser.add_argument("--model-id", default="openvla/openvla-7b")
+    parser.add_argument("--unnorm-key", default="bridge_orig")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
     if args.policy == "openvla":
-        policy = OpenVLAPolicy(model_id=args.model_id, device=args.device)
+        policy = OpenVLAPolicy(model_id=args.model_id, device=args.device, unnorm_key=args.unnorm_key)
     else:
         policy = DummyPolicy()
 

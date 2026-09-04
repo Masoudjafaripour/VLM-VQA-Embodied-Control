@@ -54,7 +54,7 @@ MUJOCO_GL=egl vla_venv/bin/python baseline/LIBERO/libero_vla_rollout.py --policy
 # transformers>=5 removed AutoModelForVision2Seq (OpenVLA's remote code needs it) - pin to the versions OpenVLA was built against
 pip install "transformers==4.40.1" "tokenizers==0.19.1" "timm==0.9.10" "accelerate==0.25.0"
 MUJOCO_GL=egl vla_venv/bin/python baseline/LIBERO/libero_vla_rollout.py \
-    --policy openvla --model-id openvla/openvla-7b --device cuda \
+    --policy openvla --model-id openvla/openvla-7b-finetuned-libero-spatial --device cuda \
     --suite libero_spatial --task-id 0 --n-steps 50
 ```
 
@@ -62,7 +62,7 @@ Both scripts write to [`outputs/`](outputs). `libero_vla_rollout.py --help` list
 
 ## Integrating a VLM/VLA policy
 
-`libero_vla_rollout.py` defines the seam:
+The `Policy` interface (and every VLA wrapper) lives in [`baseline/Models/VLAs.py`](../Models/VLAs.py), shared with the CALVIN baseline:
 
 ```python
 class Policy:
@@ -70,13 +70,15 @@ class Policy:
         ...  # return a 7-dim action: [dx, dy, dz, droll, dpitch, dyaw, gripper]
 ```
 
-`image` is the `agentview_image` frame (H, W, 3) `uint8`, `instruction` is `task.language` from the benchmark (e.g. `"pick up the black bowl between the plate and the ramekin and place it on the plate"`). Any VLM/VLA that can be wrapped into that one method — OpenVLA, Octo, a fine-tuned RT-family model, or your own VQA-driven controller from this repo — plugs straight into `rollout()`.
+`image` is the `agentview_image` frame (H, W, 3) `uint8`, `instruction` is `task.language` from the benchmark (e.g. `"pick up the black bowl between the plate and the ramekin and place it on the plate"`). Any VLM/VLA that can be wrapped into that one method plugs straight into `rollout()`.
 
-`OpenVLAPolicy` in the same file is a concrete example (HuggingFace `transformers`, `openvla/openvla-7b`, `predict_action(...)`). Select it from the CLI with `--policy openvla` (see [Running](#running) above), or instantiate it directly in your own code:
+`OpenVLAPolicy` is a concrete example (HuggingFace `transformers`, `predict_action(...)`, defaults to the LIBERO-spatial-finetuned checkpoint). Select it from the CLI with `--policy openvla` (see [Running](#running) above), or instantiate it directly:
 
 ```python
 policy = OpenVLAPolicy(unnorm_key="libero_spatial")  # instead of DummyPolicy()
 ```
+
+See [`baseline/Models/README.md`](../Models/README.md) for the full set of VLAs wired up (SmolVLA, pi0/pi0.5, Octo, RT-1/RT-2, CoT-VLA) and the multi-model `eval.py` harness that sweeps success rate across both LIBERO and CALVIN.
 
 ## Sample output
 

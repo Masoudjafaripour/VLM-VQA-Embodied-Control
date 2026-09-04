@@ -55,3 +55,7 @@ Baseline setup for the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBER
 Baseline setup for the [CALVIN](https://github.com/mees/calvin) long-horizon, language-conditioned manipulation benchmark, with the same pluggable VLM/VLA rollout loop. See [baseline/CALVIN/](baseline/CALVIN/) for setup, scripts, and details.
 
 <img src="baseline/CALVIN/outputs/calvin_scene_D_lift_pink_block_table.png" width="300"> <img src="baseline/CALVIN/outputs/calvin_scene_D_lift_red_block_table_rollout.gif" width="300">
+
+## VLA Evaluation
+
+A shared `Policy` interface plus wrappers for OpenVLA, SmolVLA, pi0/pi0.5, Octo, RT-1/RT-2, and CoT-VLA, evaluated on the LIBERO and CALVIN baselines above. OpenVLA (real 7B, LIBERO-finetuned checkpoint) and SmolVLA are actually validated with real weights; the rest are wired up with correct loading code but not executed here (different frameworks, multi-GB checkpoints, or no public weights at all). See [baseline/Models/](baseline/Models/) for the eval harness, per-model status, and sample results.

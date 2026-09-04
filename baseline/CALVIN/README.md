@@ -40,15 +40,15 @@ vla_venv/bin/python baseline/CALVIN/calvin_vla_rollout.py --policy dummy
 # rollout with a real VLA (OpenVLA), on a machine with a GPU
 pip install "transformers==4.40.1" "tokenizers==0.19.1" "timm==0.9.10" "accelerate==0.25.0"
 vla_venv/bin/python baseline/CALVIN/calvin_vla_rollout.py \
-    --policy openvla --model-id openvla/openvla-7b --device cuda \
+    --policy openvla --model-id openvla/openvla-7b --unnorm-key bridge_orig --device cuda \
     --scene calvin_scene_D --task lift_red_block_table --n-steps 50
 ```
 
-Both scripts write to [`outputs/`](outputs). `calvin_vla_rollout.py --help` lists all flags (`--scene`, `--task`, `--n-steps`, `--model-id`, `--device`).
+Both scripts write to [`outputs/`](outputs). `calvin_vla_rollout.py --help` lists all flags (`--scene`, `--task`, `--n-steps`, `--model-id`, `--unnorm-key`, `--device`).
 
 ## Integrating a VLM/VLA policy
 
-`calvin_vla_rollout.py` defines the same seam as the LIBERO baseline:
+The `Policy` interface (and every VLA wrapper) lives in [`baseline/Models/VLAs.py`](../Models/VLAs.py), shared with the LIBERO baseline:
 
 ```python
 class Policy:
@@ -58,7 +58,9 @@ class Policy:
 
 `image` is a rendered `(H, W, 3)` `uint8` frame from `env.render(mode="rgb_array")`, `instruction` is a plain-English stand-in for the CALVIN task name (see `TASK_TO_INSTRUCTION` — the real benchmark pairs each task with crowd-sourced language annotations shipped separately with `calvin_models`). Any VLM/VLA wrapped into that one method plugs straight into `rollout()`.
 
-`OpenVLAPolicy` is the same wrapper used in the LIBERO baseline. OpenVLA isn't released with a CALVIN-specific action head, so `unnorm_key` should point at whichever dataset your fine-tuned checkpoint was trained on.
+`OpenVLAPolicy` is the same wrapper used in the LIBERO baseline. OpenVLA isn't released with a CALVIN-specific action head, so `--unnorm-key` should point at whichever dataset your fine-tuned checkpoint was trained on (defaults to `bridge_orig`, a generic OpenX manipulation dataset).
+
+See [`baseline/Models/README.md`](../Models/README.md) for the full set of VLAs wired up (SmolVLA, pi0/pi0.5, Octo, RT-1/RT-2, CoT-VLA) and the multi-model `eval.py` harness that sweeps success rate across both LIBERO and CALVIN.
 
 ## Sample output
 
