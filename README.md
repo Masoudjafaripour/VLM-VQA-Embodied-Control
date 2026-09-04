@@ -49,3 +49,9 @@ Implements differential inverse kinematics with null space control on a UR5e arm
 Baseline setup for the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) manipulation benchmark, with a pluggable VLM/VLA rollout loop. See [baseline/LIBERO/](baseline/LIBERO/) for setup, scripts, and details.
 
 <img src="baseline/LIBERO/outputs/libero_spatial_task0.png" width="300"> <img src="baseline/LIBERO/outputs/libero_spatial_task0_rollout.gif" width="300">
+
+## CALVIN Benchmark
+
+Baseline setup for the [CALVIN](https://github.com/mees/calvin) long-horizon, language-conditioned manipulation benchmark, with the same pluggable VLM/VLA rollout loop. See [baseline/CALVIN/](baseline/CALVIN/) for setup, scripts, and details.
+
+<img src="baseline/CALVIN/outputs/calvin_scene_D_lift_pink_block_table.png" width="300"> <img src="baseline/CALVIN/outputs/calvin_scene_D_lift_red_block_table_rollout.gif" width="300">
