@@ -41,8 +41,13 @@ CALVIN_TASKS = [
 BENCHMARKS = {"libero": (libero_rollout, LIBERO_TASKS), "calvin": (calvin_rollout, CALVIN_TASKS)}
 
 
-def evaluate(policy_name: str, benchmark_name: str, n_steps: int, episodes: int) -> dict:
+def evaluate(policy_name: str, benchmark_name: str, n_steps: int, episodes: int, libero_suites: list[str] | None = None) -> dict:
     rollout_fn, tasks = BENCHMARKS[benchmark_name]
+    if benchmark_name == "libero" and libero_suites:
+        # a single OpenVLAPolicy/Pi0Policy/... instance is built once below from one
+        # checkpoint, which is only meaningful for the LIBERO suite it was fine-tuned
+        # on - sweeping every suite with it by default would silently mix in wrong numbers
+        tasks = [t for t in tasks if t[0] in libero_suites]
     policy = POLICY_REGISTRY[policy_name]()  # built once - VLA weights are too heavy to reload per episode
     gif_dir = os.path.join(RESULTS_DIR, policy_name, benchmark_name)
     os.makedirs(gif_dir, exist_ok=True)
@@ -81,8 +86,11 @@ def save_result(result: dict) -> str:
 
 
 def plot_results():
-    """Bar chart of success rate per policy/benchmark, built from every result
-    JSON on disk under results/ (not just the policies/benchmarks just run)."""
+    """Per-episode outcome dots for every (policy, benchmark) result JSON on disk
+    under results/ (not just the ones just run). A bar chart of success *rate*
+    is unreadable at the trial counts these smoke tests use - a 0/4 result is a
+    zero-height bar, i.e. an empty-looking plot - so this plots one marker per
+    episode instead, which stays visible regardless of the outcome."""
     rows = []
     for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*", "*.json"))):
         with open(path) as f:
@@ -92,29 +100,25 @@ def plot_results():
     if not rows:
         return None
 
-    policies = sorted({r["policy"] for r in rows})
-    benchmarks = sorted({r["benchmark"] for r in rows})
-    width = 0.8 / len(benchmarks)
+    rows.sort(key=lambda r: (r["policy"], r["benchmark"]))
+    max_episodes = max(r["episodes"] for r in rows)
 
-    fig, ax = plt.subplots(figsize=(1.5 * len(policies) + 2, 4))
-    for i, benchmark in enumerate(benchmarks):
-        entries = [next((r for r in rows if r["policy"] == p and r["benchmark"] == benchmark), None) for p in policies]
-        rates = [e["success_rate"] if e else 0 for e in entries]
-        x = [j + i * width for j in range(len(policies))]
-        bars = ax.bar(x, rates, width=width, label=benchmark)
-        for bar, e in zip(bars, entries):
-            if e is None:
-                continue
-            # label every bar with successes/episodes, even 0-height ones, so the
-            # chart still says something when every rate happens to be 0
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02, f"{e['successes']}/{e['episodes']}", ha="center", va="bottom", fontsize=8)
+    fig, ax = plt.subplots(figsize=(max(6, max_episodes + 3), 0.6 * len(rows) + 1.5))
+    for i, r in enumerate(rows):
+        n, k = r["episodes"], r["successes"]
+        for j in range(n):
+            ok = j < k
+            ax.scatter(j, i, marker="o" if ok else "x", s=140, linewidths=2, color="tab:green" if ok else "tab:red", zorder=3)
+        ax.text(n + 0.4, i, f"{k}/{n}", va="center", fontsize=9)
 
-    ax.set_xticks([j + width * (len(benchmarks) - 1) / 2 for j in range(len(policies))])
-    ax.set_xticklabels(policies)
-    ax.set_ylabel("success rate")
-    ax.set_ylim(0, 1)
-    ax.set_title("VLA success rate by benchmark")
-    ax.legend()
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([f"{r['policy']} / {r['benchmark']}" for r in rows])
+    ax.set_xlabel("episode")
+    ax.set_xlim(-0.6, max_episodes + 1.6)
+    ax.set_xticks(range(max_episodes))
+    ax.grid(axis="x", alpha=0.3, zorder=0)
+    ax.invert_yaxis()
+    ax.set_title("VLA rollout outcomes per episode (● success   ✕ fail)")
     fig.tight_layout()
 
     out_path = os.path.join(RESULTS_DIR, "summary_plot.png")
@@ -127,7 +131,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--policies", nargs="+", default=["dummy"], choices=list(POLICY_REGISTRY))
     parser.add_argument("--benchmarks", nargs="+", default=["libero", "calvin"], choices=list(BENCHMARKS))
-    parser.add_argument("--n-steps", type=int, default=30)
+    parser.add_argument(
+        "--libero-suites",
+        nargs="+",
+        default=["libero_spatial"],
+        choices=[t[0] for t in LIBERO_TASKS],
+        help="which LIBERO suites to run when 'libero' is in --benchmarks (default: just the suite the default "
+        "OpenVLA checkpoint is fine-tuned on - pass all 4 only if your policy/checkpoint isn't suite-specific)",
+    )
+    parser.add_argument("--n-steps", type=int, default=50)
     parser.add_argument("--episodes", type=int, default=1)
     args = parser.parse_args()
 
@@ -135,7 +147,7 @@ def main():
     for policy_name in args.policies:
         for benchmark_name in args.benchmarks:
             try:
-                result = evaluate(policy_name, benchmark_name, args.n_steps, args.episodes)
+                result = evaluate(policy_name, benchmark_name, args.n_steps, args.episodes, args.libero_suites)
             except Exception as e:
                 result = {"policy": policy_name, "benchmark": benchmark_name, "status": "not_run", "reason": str(e)}
             out_path = save_result(result)

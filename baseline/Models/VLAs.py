@@ -10,6 +10,8 @@ See README.md for per-model install commands, which venv each needs, checkpoint
 choices, and which of these actually ran here vs. are wired-but-unexecuted or
 have no public weights at all.
 """
+import os
+
 import numpy as np
 
 
@@ -165,23 +167,89 @@ class OctoPolicy(Policy):
 # --------------------------------------------------------------------------
 # RT-1 - https://github.com/google-research/robotics_transformer (TensorFlow).
 # Public checkpoints, but a third framework alongside JAX/torch above; needs
-# its own venv too.
+# its own venv (vla_venv_tf, see README.md).
+#
+# The checkpoint isn't a bare forward-pass model: it's a tf_agents TFPolicy
+# SavedModel, exported with 'action' and 'get_initial_state' signatures. It's
+# stateful (keeps a 6-frame image/action-token history across calls) and was
+# trained on real-robot observations this repo's sim envs don't produce -
+# proprioceptive/workspace-calibration fields below (gripper_closed,
+# workspace_bounds, orientation_box, ...) are zero-filled placeholders, and the
+# instruction is embedded with the Universal Sentence Encoder RT-1 was trained
+# against, not learned end-to-end from raw text like OpenVLA/SmolVLA.
 # --------------------------------------------------------------------------
 class RT1Policy(Policy):
-    """Needs its own venv:
-        pip install tensorflow tensorflow-hub
-        gsutil -m cp -r gs://gresearch/robotics/rt1main ./rt1_checkpoint
+    """Needs its own venv (see README.md for the full recipe, including why
+    tf-agents needs --no-deps on Python 3.12 and the setuptools<81 pin
+    tensorflow_hub needs for pkg_resources).
+    Checkpoint: clone https://github.com/google-research/robotics_transformer
+    and fetch trained_checkpoints/rt1main via git-lfs (or the
+    media.githubusercontent.com LFS endpoint directly, if git-lfs isn't installed).
     """
 
-    def __init__(self, checkpoint_dir: str = "./rt1_checkpoint"):
+    IMAGE_HW = (256, 320)  # (height, width) - RT-1's real-robot camera aspect ratio, not square like LIBERO/CALVIN
+
+    def __init__(
+        self,
+        checkpoint_dir: str = "~/rt1_repo/trained_checkpoints/rt1main",
+        use_model: str = "https://tfhub.dev/google/universal-sentence-encoder-large/5",
+    ):
+        checkpoint_dir = os.path.expanduser(checkpoint_dir)
         try:
             import tensorflow as tf
+            import tensorflow_hub as hub
+            import tf_agents  # noqa: F401 - import side effect: registers the TypeSpec RT-1's SavedModel needs
         except ImportError as e:
-            raise NotImplementedError("tensorflow is not installed - RT-1 needs its own TF venv, see README.md") from e
+            raise NotImplementedError("tensorflow/tf_agents/tensorflow_hub are not installed - RT-1 needs its own TF venv, see README.md") from e
+
+        self.tf = tf
         self.model = tf.saved_model.load(checkpoint_dir)
+        self.use = hub.load(use_model)
+        self.policy_state = None
+
+    def reset(self):
+        self.policy_state = None
 
     def get_action(self, image: np.ndarray, instruction: str) -> np.ndarray:
-        raise NotImplementedError("wire up RT-1's observation/action spec for your checkpoint before calling this")
+        tf = self.tf
+        first_step = self.policy_state is None
+        if first_step:
+            self.policy_state = self.model.signatures["get_initial_state"](batch_size=tf.constant(1))
+
+        image_resized = tf.image.resize(image, self.IMAGE_HW, method="bilinear")
+        image_resized = tf.cast(image_resized, tf.uint8)
+        instruction_embedding = self.use([instruction])[0]
+
+        zeros = lambda *shape: tf.zeros((1, *shape), dtype=tf.float32)  # noqa: E731 - placeholders for real-robot-only fields, see class docstring
+        observation = {
+            "image": image_resized[tf.newaxis, ...],
+            "natural_language_instruction": tf.constant([instruction]),
+            "natural_language_embedding": instruction_embedding[tf.newaxis, ...],
+            "gripper_closed": zeros(1),
+            "gripper_closedness_commanded": zeros(1),
+            "height_to_bottom": zeros(1),
+            "base_pose_tool_reached": zeros(7),
+            "workspace_bounds": zeros(3, 3),
+            "robot_orientation_positions_box": zeros(3, 3),
+            "orientation_box": zeros(2, 3),
+            "orientation_start": zeros(4),
+            "src_rotation": zeros(4),
+            "vector_to_go": zeros(3),
+            "rotation_delta_to_go": zeros(3),
+        }
+        inputs = {f"0/observation/{k}": v for k, v in observation.items()}
+        inputs["0/step_type"] = tf.constant([0 if first_step else 1], dtype=tf.int32)
+        inputs["0/reward"] = tf.constant([0.0], dtype=tf.float32)
+        inputs["0/discount"] = tf.constant([1.0], dtype=tf.float32)
+        inputs.update({f"1/{k}": v for k, v in self.policy_state.items()})
+
+        result = self.model.signatures["action"](**inputs)
+        self.policy_state = {k[len("state/"):]: v for k, v in result.items() if k.startswith("state/")}
+
+        world_vector = result["action/world_vector"][0].numpy()
+        rotation_delta = result["action/rotation_delta"][0].numpy()
+        gripper = np.atleast_1d(result["action/gripper_closedness_action"][0].numpy())[:1]
+        return np.concatenate([world_vector, rotation_delta, gripper])
 
 
 # --------------------------------------------------------------------------
