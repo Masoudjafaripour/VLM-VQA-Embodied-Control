@@ -1,15 +1,18 @@
 """
-DAgger (Ross, Gordon & Bagnell, 2011) on a 2-link planar arm reaching task.
+DAgger (Ross, Gordon & Bagnell, 2011) on a 3-DOF spherical-shoulder arm reaching task.
+3D analog of DAgger_2D_policy.py: same DAgger machinery, three data modes, and
+train/val comparison GIFs, but a 3D arm with closed-form 3D IK.
 
-Env:      2-link arm, base fixed at origin, reaches a randomly sampled goal
-          point in its workspace. Expert = closed-form inverse kinematics.
+Env:      shoulder azimuth (phi) + shoulder elevation (theta) + elbow (gamma).
+          phi rotates the arm's vertical plane around the z-axis; theta/gamma
+          are a standard 2-link IK problem solved inside that plane.
 Modes:    --mode state   -> MLP over (joint angles, goal)
-          --mode vision  -> CNN over a rendered RGB image only
+          --mode vision  -> CNN over a rendered RGB image (fixed isometric camera)
           --mode both    -> CNN + state MLP fused
           --mode all     -> trains all three and compares them
 
 Usage:
-    python DAgger_2D_policy.py --mode all --iterations 8
+    python DAgger_3D_policy.py --mode all --iterations 8
 """
 
 import argparse
@@ -24,15 +27,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3D projection)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ISO_COS, ISO_SIN = np.cos(np.pi / 6), np.sin(np.pi / 6)  # cheap fixed isometric camera
+
+
+def project_iso(p):
+    """Fixed isometric projection (no per-call trig) used for the fast cv2 render."""
+    x, y, z = p
+    return (x - y) * ISO_COS, (x + y) * ISO_SIN - z
 
 
 # --------------------------------------------------------------------------
 # Environment
 # --------------------------------------------------------------------------
-class Arm2DEnv:
-    """2-link planar arm. Angles wrap in [-pi, pi]; base at the origin."""
+class Arm3DEnv:
+    """3-DOF arm: angles = (phi, theta, gamma) = (shoulder azimuth, shoulder
+    elevation, elbow). FK/IK reduce to the 2D 2-link case inside the plane
+    picked by phi, so IK stays closed-form."""
 
     def __init__(self, l1=1.0, l2=1.0, dt=0.1, max_steps=50,
                  max_angular_speed=0.35, goal_eps=0.08, image_size=64, seed=0):
@@ -45,72 +59,76 @@ class Arm2DEnv:
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.reach = l1 + l2
-        self.theta = np.zeros(2)
-        self.goal = np.zeros(2)
+        self.angles = np.zeros(3)  # (phi, theta, gamma)
+        self.goal = np.zeros(3)
         self.t = 0
 
-    def forward_kinematics(self, theta):
-        t1, t2 = theta
-        x1, y1 = self.l1 * np.cos(t1), self.l1 * np.sin(t1)
-        x2 = x1 + self.l2 * np.cos(t1 + t2)
-        y2 = y1 + self.l2 * np.sin(t1 + t2)
-        return np.array([x1, y1]), np.array([x2, y2])
+    def forward_kinematics(self, angles):
+        phi, theta, gamma = angles
+        r1, z1 = self.l1 * np.cos(theta), self.l1 * np.sin(theta)
+        r2 = r1 + self.l2 * np.cos(theta + gamma)
+        z2 = z1 + self.l2 * np.sin(theta + gamma)
+        elbow = np.array([r1 * np.cos(phi), r1 * np.sin(phi), z1])
+        ee = np.array([r2 * np.cos(phi), r2 * np.sin(phi), z2])
+        return elbow, ee
 
-    def inverse_kinematics(self, xy):
-        x, y = xy
-        r2 = x * x + y * y
-        cos_t2 = np.clip((r2 - self.l1 ** 2 - self.l2 ** 2) / (2 * self.l1 * self.l2), -1.0, 1.0)
-        t2 = np.arccos(cos_t2)  # elbow-down solution
-        k1 = self.l1 + self.l2 * np.cos(t2)
-        k2 = self.l2 * np.sin(t2)
-        t1 = np.arctan2(y, x) - np.arctan2(k2, k1)
-        return np.array([t1, t2])
+    def inverse_kinematics(self, xyz):
+        x, y, z = xyz
+        phi = np.arctan2(y, x)
+        r = np.hypot(x, y)
+        cos_gamma = np.clip((r ** 2 + z ** 2 - self.l1 ** 2 - self.l2 ** 2) / (2 * self.l1 * self.l2), -1.0, 1.0)
+        gamma = np.arccos(cos_gamma)  # elbow-down solution
+        k1 = self.l1 + self.l2 * np.cos(gamma)
+        k2 = self.l2 * np.sin(gamma)
+        theta = np.arctan2(z, r) - np.arctan2(k2, k1)
+        return np.array([phi, theta, gamma])
 
     def reset(self):
-        self.theta = self.rng.uniform(-np.pi, np.pi, size=2)
-        goal_theta = self.rng.uniform(-np.pi, np.pi, size=2)
-        _, self.goal = self.forward_kinematics(goal_theta)
+        self.angles = self.rng.uniform(-np.pi, np.pi, size=3)
+        goal_angles = self.rng.uniform(-np.pi, np.pi, size=3)
+        _, self.goal = self.forward_kinematics(goal_angles)
         self.t = 0
         return self._obs()
 
     def step(self, action):
         action = np.clip(action, -self.max_speed, self.max_speed)
-        self.theta = np.arctan2(np.sin(self.theta + action * self.dt),
-                                 np.cos(self.theta + action * self.dt))
+        self.angles = np.arctan2(np.sin(self.angles + action * self.dt),
+                                  np.cos(self.angles + action * self.dt))
         self.t += 1
-        _, ee = self.forward_kinematics(self.theta)
+        _, ee = self.forward_kinematics(self.angles)
         dist = float(np.linalg.norm(ee - self.goal))
         done = dist < self.goal_eps or self.t >= self.max_steps
         return self._obs(), done, {"dist": dist, "success": dist < self.goal_eps}
 
     def expert_action(self):
         target = self.inverse_kinematics(self.goal)
-        diff = np.arctan2(np.sin(target - self.theta), np.cos(target - self.theta))
+        diff = np.arctan2(np.sin(target - self.angles), np.cos(target - self.angles))
         return np.clip(diff / self.dt, -self.max_speed, self.max_speed)
 
     def state_vector(self):
-        # sin/cos encoding avoids the -pi/pi wrap discontinuity
-        return np.array([np.sin(self.theta[0]), np.cos(self.theta[0]),
-                          np.sin(self.theta[1]), np.cos(self.theta[1]),
-                          self.goal[0], self.goal[1]], dtype=np.float32)
+        s = np.sin(self.angles)
+        c = np.cos(self.angles)
+        return np.array([s[0], c[0], s[1], c[1], s[2], c[2],
+                          self.goal[0], self.goal[1], self.goal[2]], dtype=np.float32)
 
     def render_rgb(self):
-        """Fast rasterized RGB observation (cv2), used during training/rollouts."""
+        """Fast rasterized RGB observation (cv2, fixed isometric camera)."""
         s = self.image_size
         img = np.full((s, s, 3), 255, dtype=np.uint8)
-        scale = s / (2.2 * self.reach)
+        scale = s / (4.5 * self.reach)
 
         def to_px(p):
-            return (int(s / 2 + p[0] * scale), int(s / 2 - p[1] * scale))
+            sx, sy = project_iso(p)
+            return (int(s / 2 + sx * scale), int(s / 2 - sy * scale))
 
-        base = to_px((0, 0))
-        j1, ee = self.forward_kinematics(self.theta)
-        j1_px, ee_px = to_px(j1), to_px(ee)
+        base = to_px((0, 0, 0))
+        elbow, ee = self.forward_kinematics(self.angles)
+        elbow_px, ee_px = to_px(elbow), to_px(ee)
         goal_px = to_px(self.goal)
-        cv2.line(img, base, j1_px, (30, 30, 200), 3)
-        cv2.line(img, j1_px, ee_px, (200, 60, 30), 3)
+        cv2.line(img, base, elbow_px, (30, 30, 200), 3)
+        cv2.line(img, elbow_px, ee_px, (200, 60, 30), 3)
         cv2.circle(img, base, 4, (0, 0, 0), -1)
-        cv2.circle(img, j1_px, 3, (0, 0, 0), -1)
+        cv2.circle(img, elbow_px, 3, (0, 0, 0), -1)
         cv2.circle(img, ee_px, 4, (0, 150, 0), -1)
         cv2.drawMarker(img, goal_px, (0, 0, 0), markerType=cv2.MARKER_STAR, markerSize=10, thickness=1)
         return img
@@ -139,7 +157,7 @@ class ConvEncoder(nn.Module):
 
 
 class StatePolicy(nn.Module):
-    def __init__(self, state_dim=6, action_dim=2):
+    def __init__(self, state_dim=9, action_dim=3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64), nn.ReLU(),
@@ -152,7 +170,7 @@ class StatePolicy(nn.Module):
 
 
 class VisionPolicy(nn.Module):
-    def __init__(self, action_dim=2):
+    def __init__(self, action_dim=3):
         super().__init__()
         self.enc = ConvEncoder(128)
         self.head = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, action_dim))
@@ -162,7 +180,7 @@ class VisionPolicy(nn.Module):
 
 
 class FusionPolicy(nn.Module):
-    def __init__(self, state_dim=6, action_dim=2):
+    def __init__(self, state_dim=9, action_dim=3):
         super().__init__()
         self.enc = ConvEncoder(128)
         self.state_mlp = nn.Sequential(nn.Linear(state_dim, 32), nn.ReLU())
@@ -212,7 +230,7 @@ class Dataset:
         return states, images, actions
 
 
-def rollout(env, policy, mode, beta, dataset, iteration=0, max_steps=None):
+def rollout(env, policy, mode, beta, dataset, iteration=0):
     """Roll out beta*expert + (1-beta)*policy, always labeling with the expert."""
     obs = env.reset()
     done = False
@@ -280,15 +298,15 @@ def evaluate(env, policy, mode, n_episodes):
 
 def dagger(mode, iterations, episodes_per_iter, epochs, eval_episodes, seed, image_size,
            max_steps=50, log_fn=print):
-    env = Arm2DEnv(image_size=image_size, seed=seed, max_steps=max_steps)
+    env = Arm3DEnv(image_size=image_size, seed=seed, max_steps=max_steps)
     policy = make_policy(mode)
     dataset = Dataset()
     history = []
-    loss_log = {"train": [], "val": [], "boundaries": []}  # boundaries = epoch index where each DAgger iter starts
+    loss_log = {"train": [], "val": [], "boundaries": []}
 
     for it in range(iterations):
-        beta = 1.0 if it == 0 else max(0.0, 0.6 ** it)  # first round: pure expert
-        policy_frac = 1.0 - beta  # fraction of rollout actions taken by the learned policy
+        beta = 1.0 if it == 0 else max(0.0, 0.6 ** it)
+        policy_frac = 1.0 - beta
         for _ in range(episodes_per_iter):
             rollout(env, policy if it > 0 else None, mode, beta, dataset, iteration=it)
 
@@ -311,48 +329,44 @@ def dagger(mode, iterations, episodes_per_iter, epochs, eval_episodes, seed, ima
 # Visualization
 # --------------------------------------------------------------------------
 def rollout_from_state(env, actor, mode, max_frames):
-    """Roll out from env's *current* theta/goal (no reset), so a policy run and an expert
-    (ground-truth) run can be replayed from the exact same start state for comparison.
-    `actor` is either a policy module or the string "expert"."""
+    """Roll out from env's *current* angles/goal (no reset), so a policy run and an
+    expert (ground-truth) run can be replayed from the exact same start state."""
     obs = env._obs()
-    frames_theta = [env.theta.copy()]
+    frames = [env.angles.copy()]
     done, info = False, {}
-    while not done and len(frames_theta) < max_frames:
+    while not done and len(frames) < max_frames:
         act = env.expert_action() if actor == "expert" else policy_action(actor, obs, mode)
         obs, done, info = env.step(act)
-        frames_theta.append(env.theta.copy())
-    return frames_theta, info
+        frames.append(env.angles.copy())
+    return frames, info
 
 
 def build_demo_episode(env, l1, l2, dt, max_speed, goal_eps, image_size, seed, policy, mode, max_frames):
     """One episode for the GIF: policy rollout + a ground-truth expert rollout replayed
     from the identical start state/goal, for a direct visual comparison."""
-    policy_env = Arm2DEnv(l1=l1, l2=l2, dt=dt, max_steps=max_frames, max_angular_speed=max_speed,
+    policy_env = Arm3DEnv(l1=l1, l2=l2, dt=dt, max_steps=max_frames, max_angular_speed=max_speed,
                            goal_eps=goal_eps, image_size=image_size, seed=seed)
     policy_env.reset()
-    theta0, goal = policy_env.theta.copy(), policy_env.goal.copy()
+    angles0, goal = policy_env.angles.copy(), policy_env.goal.copy()
     policy_frames, policy_info = rollout_from_state(policy_env, policy, mode, max_frames)
 
-    expert_env = Arm2DEnv(l1=l1, l2=l2, dt=dt, max_steps=max_frames, max_angular_speed=max_speed,
+    expert_env = Arm3DEnv(l1=l1, l2=l2, dt=dt, max_steps=max_frames, max_angular_speed=max_speed,
                            goal_eps=goal_eps, image_size=image_size, seed=seed)
-    expert_env.theta, expert_env.goal, expert_env.t = theta0.copy(), goal.copy(), 0
+    expert_env.angles, expert_env.goal, expert_env.t = angles0.copy(), goal.copy(), 0
     expert_frames, expert_info = rollout_from_state(expert_env, "expert", mode, max_frames)
 
     return {
-        "env": policy_env, "theta0": theta0, "goal": goal,
+        "env": policy_env, "angles0": angles0, "goal": goal,
         "policy_frames": policy_frames, "policy_info": policy_info,
-        "expert_ee_path": [policy_env.forward_kinematics(t)[1] for t in expert_frames],
+        "expert_ee_path": [policy_env.forward_kinematics(a)[1] for a in expert_frames],
     }
 
 
 def render_train_val_gif(env, policy, mode, out_path, val_seed_offset=999, demo_max_steps=150):
-    """Side-by-side GIF: an in-distribution ('train') episode next to a held-out
-    ('val') episode drawn from an independently seeded env the policy never trained on.
-    Each panel shows the policy rollout (start/end markers + solid trace) against the
-    ground-truth expert path from the same start/goal (dashed), so you can see how far
-    the learned policy deviates from the expert demonstration.
-    Demo episodes run for `demo_max_steps` (independent of the shorter training horizon)
-    so the arm has time to reach the goal, or to clearly show it failing to."""
+    """Side-by-side 3D GIF: an in-distribution ('train') episode next to a held-out
+    ('val') episode from an independently seeded env. Each panel shows the policy
+    rollout (start/end markers + solid trace) against the ground-truth expert path
+    from the same start/goal (dashed)."""
     max_frames = demo_max_steps + 1
     common = dict(l1=env.l1, l2=env.l2, dt=env.dt, max_speed=env.max_speed, goal_eps=env.goal_eps,
                   image_size=env.image_size, policy=policy, mode=mode, max_frames=max_frames)
@@ -365,46 +379,47 @@ def render_train_val_gif(env, policy, mode, out_path, val_seed_offset=999, demo_
         ep["policy_frames"] += [ep["policy_frames"][-1]] * (n_frames - len(ep["policy_frames"]))
 
     reach = env.l1 + env.l2
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4.5))
+    fig = plt.figure(figsize=(9, 4.5))
     panels = []
-    for ax, ep, label in zip(axes, episodes, ["train", "val (held-out)"]):
-        ax.set_xlim(-reach * 1.1, reach * 1.1)
-        ax.set_ylim(-reach * 1.1, reach * 1.1)
-        ax.set_aspect("equal")
-        ax.add_patch(plt.Circle((0, 0), reach, fill=False, linestyle="--", color="gray", alpha=0.5))
+    for i, (ep, label) in enumerate(zip(episodes, ["train", "val (held-out)"])):
+        ax = fig.add_subplot(1, 2, i + 1, projection="3d")
+        ax.set_xlim(-reach, reach); ax.set_ylim(-reach, reach); ax.set_zlim(-reach, reach)
+        ax.set_box_aspect([1, 1, 1])
+        ax.view_init(elev=22, azim=45)
+        u, v = np.mgrid[0:2 * np.pi:20j, 0:np.pi:10j]
+        ax.plot_wireframe(reach * np.cos(u) * np.sin(v), reach * np.sin(u) * np.sin(v), reach * np.cos(v),
+                           color="gray", alpha=0.1, linewidth=0.5)
         gt = np.array(ep["expert_ee_path"])
-        ax.plot(gt[:, 0], gt[:, 1], "--", color="black", alpha=0.6, linewidth=1.5, label="G.T. (expert)")
+        ax.plot(gt[:, 0], gt[:, 1], gt[:, 2], "--", color="black", alpha=0.6, linewidth=1.5, label="G.T. (expert)")
         ax.plot(*ep["goal"], marker="*", color="black", markersize=14, label="goal")
-        start_ee = ep["env"].forward_kinematics(ep["theta0"])[1]
+        start_ee = ep["env"].forward_kinematics(ep["angles0"])[1]
         ax.plot(*start_ee, marker="o", markerfacecolor="white", markeredgecolor="black",
                 markersize=8, label="start")
         end_ee = ep["env"].forward_kinematics(ep["policy_frames"][-1])[1]
-        end_marker, = ax.plot(*end_ee, marker="X", color="#2ca02c", markersize=9,
-                               linestyle="None", label="end (policy)")
+        end_marker, = ax.plot([end_ee[0]], [end_ee[1]], [end_ee[2]], marker="X", color="#2ca02c",
+                               markersize=9, linestyle="None", label="end (policy)")
         end_marker.set_visible(False)
-        link1, = ax.plot([], [], "-o", color="#1f77b4", linewidth=4, markersize=6)
-        link2, = ax.plot([], [], "-o", color="#d62728", linewidth=4, markersize=6)
-        trace, = ax.plot([], [], "-", color="#2ca02c", alpha=0.6, linewidth=1.5, label="policy")
+        link1, = ax.plot([], [], [], "-o", color="#1f77b4", linewidth=4, markersize=6)
+        link2, = ax.plot([], [], [], "-o", color="#d62728", linewidth=4, markersize=6)
+        trace, = ax.plot([], [], [], "-", color="#2ca02c", alpha=0.6, linewidth=1.5, label="policy")
         ax.set_title(f"{label}: {'success' if ep['policy_info'].get('success') else 'timeout'}")
         ax.legend(loc="upper right", fontsize=6)
-        panels.append((link1, link2, trace, end_marker, [], []))
-    fig.suptitle(f"DAgger arm ({mode})")
+        panels.append((link1, link2, trace, end_marker, [], [], []))
+    fig.suptitle(f"DAgger 3D arm ({mode})")
 
     def update(i):
-        artists = []
-        for ep, (link1, link2, trace, end_marker, tx, ty) in zip(episodes, panels):
-            theta = ep["policy_frames"][i]
-            j1, ee = ep["env"].forward_kinematics(theta)
-            link1.set_data([0, j1[0]], [0, j1[1]])
-            link2.set_data([j1[0], ee[0]], [j1[1], ee[1]])
-            tx.append(ee[0]); ty.append(ee[1])
-            trace.set_data(tx, ty)
+        for ep, (link1, link2, trace, end_marker, tx, ty, tz) in zip(episodes, panels):
+            angles = ep["policy_frames"][i]
+            j1, ee = ep["env"].forward_kinematics(angles)
+            link1.set_data([0, j1[0]], [0, j1[1]]); link1.set_3d_properties([0, j1[2]])
+            link2.set_data([j1[0], ee[0]], [j1[1], ee[1]]); link2.set_3d_properties([j1[2], ee[2]])
+            tx.append(ee[0]); ty.append(ee[1]); tz.append(ee[2])
+            trace.set_data(tx, ty); trace.set_3d_properties(tz)
             if i == n_frames - 1:
                 end_marker.set_visible(True)
-            artists += [link1, link2, trace, end_marker]
-        return artists
+        return []
 
-    anim = matplotlib.animation.FuncAnimation(fig, update, frames=n_frames, interval=100, blit=True)
+    anim = matplotlib.animation.FuncAnimation(fig, update, frames=n_frames, interval=100, blit=False)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     anim.save(out_path, writer="pillow", fps=20)
@@ -431,40 +446,38 @@ def plot_loss_curve(mode, loss_log, out_path):
 
 
 def plot_data_distribution(dataset, env, mode, out_path):
-    """Coverage of the aggregated DAgger dataset: visited end-effector positions and joint
-    configs (colored by which DAgger iteration collected them), sampled goals, and the
-    expert action labels. Iteration-0 (pure expert) points cover only the expert's own
-    trajectories; later points show the policy-visited states DAgger adds on top."""
+    """Coverage of the aggregated DAgger dataset: visited end-effector/goal positions
+    in 3D (colored by which DAgger iteration collected them), shoulder-elevation vs
+    elbow-angle coverage, and the expert action labels (theta/gamma components)."""
     states = np.stack(dataset.states)
     actions = np.stack(dataset.actions)
     iters = np.array(dataset.iters)
-    theta1 = np.arctan2(states[:, 0], states[:, 1])
-    theta2 = np.arctan2(states[:, 2], states[:, 3])
-    goals = states[:, 4:6]
-    ee = np.stack([env.forward_kinematics(np.array([t1, t2]))[1] for t1, t2 in zip(theta1, theta2)])
+    phi = np.arctan2(states[:, 0], states[:, 1])
+    theta = np.arctan2(states[:, 2], states[:, 3])
+    gamma = np.arctan2(states[:, 4], states[:, 5])
+    goals = states[:, 6:9]
+    ee = np.stack([env.forward_kinematics(a)[1] for a in zip(phi, theta, gamma)])
 
-    reach = env.l1 + env.l2
-    fig, axes = plt.subplots(2, 2, figsize=(10, 9))
+    fig = plt.figure(figsize=(10, 9))
+    ax1 = fig.add_subplot(2, 2, 1, projection="3d")
+    sc = ax1.scatter(ee[:, 0], ee[:, 1], ee[:, 2], c=iters, cmap="viridis", s=4, alpha=0.5)
+    ax1.set_title("Visited end-effector positions")
+    fig.colorbar(sc, ax=ax1, label="DAgger iteration", shrink=0.6)
 
-    sc = axes[0, 0].scatter(ee[:, 0], ee[:, 1], c=iters, cmap="viridis", s=4, alpha=0.5)
-    axes[0, 0].add_patch(plt.Circle((0, 0), reach, fill=False, linestyle="--", color="gray", alpha=0.5))
-    axes[0, 0].set_aspect("equal")
-    axes[0, 0].set_title("Visited end-effector positions")
-    fig.colorbar(sc, ax=axes[0, 0], label="DAgger iteration")
+    ax2 = fig.add_subplot(2, 2, 2, projection="3d")
+    ax2.scatter(goals[:, 0], goals[:, 1], goals[:, 2], s=4, alpha=0.3, color="black")
+    ax2.set_title("Sampled goal positions")
 
-    axes[0, 1].scatter(goals[:, 0], goals[:, 1], s=4, alpha=0.3, color="black")
-    axes[0, 1].add_patch(plt.Circle((0, 0), reach, fill=False, linestyle="--", color="gray", alpha=0.5))
-    axes[0, 1].set_aspect("equal")
-    axes[0, 1].set_title("Sampled goal positions")
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax3.scatter(theta, gamma, c=iters, cmap="viridis", s=4, alpha=0.5)
+    ax3.set_xlim(-np.pi, np.pi); ax3.set_ylim(-np.pi, np.pi)
+    ax3.set_xlabel("theta (shoulder elevation)"); ax3.set_ylabel("gamma (elbow)")
+    ax3.set_title("Visited elevation/elbow configs")
 
-    axes[1, 0].scatter(theta1, theta2, c=iters, cmap="viridis", s=4, alpha=0.5)
-    axes[1, 0].set_xlim(-np.pi, np.pi); axes[1, 0].set_ylim(-np.pi, np.pi)
-    axes[1, 0].set_xlabel("θ1"); axes[1, 0].set_ylabel("θ2")
-    axes[1, 0].set_title("Visited joint-angle configs")
-
-    axes[1, 1].hist2d(actions[:, 0], actions[:, 1], bins=40, cmap="viridis")
-    axes[1, 1].set_xlabel("Δθ1"); axes[1, 1].set_ylabel("Δθ2")
-    axes[1, 1].set_title("Expert action labels")
+    ax4 = fig.add_subplot(2, 2, 4)
+    ax4.hist2d(actions[:, 1], actions[:, 2], bins=40, cmap="viridis")
+    ax4.set_xlabel("Δtheta"); ax4.set_ylabel("Δgamma")
+    ax4.set_title("Expert action labels (theta/gamma)")
 
     fig.suptitle(f"Aggregated dataset distribution ({mode}, n={len(dataset)})")
     fig.tight_layout()
@@ -513,7 +526,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--demo-max-steps", type=int, default=150,
                          help="episode horizon used only for the rendered demo GIFs")
-    default_outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "2D")
+    default_outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "3D")
     parser.add_argument("--outdir", type=str, default=default_outdir)
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--infer", action="store_true",
@@ -525,7 +538,7 @@ def main():
     if args.infer:
         assert args.mode != "all", "--infer requires a single --mode (state|vision|both)"
         ckpt = args.checkpoint or os.path.join(args.outdir, f"{args.mode}_policy.pt")
-        env = Arm2DEnv(image_size=args.image_size, seed=args.seed, max_steps=args.max_steps)
+        env = Arm3DEnv(image_size=args.image_size, seed=args.seed, max_steps=args.max_steps)
         policy = make_policy(args.mode)
         policy.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
         policy.eval()
